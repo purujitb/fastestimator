@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # Copyright 2019 The FastEstimator Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,23 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import argparse
-
-from fastestimator.cli import configure_train_parser, configure_test_parser, configure_visualization_parser
-
-
-def run():
-    parser = argparse.ArgumentParser(allow_abbrev=False)
-    subparsers = parser.add_subparsers()
-    # In python 3.7 the following 2 lines could be put into the .add_subparsers() call
-    subparsers.required = True
-    subparsers.dest = 'mode'
-    configure_train_parser(subparsers)
-    configure_test_parser(subparsers)
-    configure_visualization_parser(subparsers)
-    args, unknown = parser.parse_known_args()
-    args.func(vars(args), unknown)
-
-
-if __name__ == '__main__':
-    run()
+from fastestimator.layers.pytorch.cropping_2d import Cropping2D

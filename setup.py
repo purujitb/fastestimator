@@ -32,10 +32,38 @@ def get_name():
         return "fastestimator"
 
 
+def get_dependency():
+    dependencies = [
+        'numpy',
+        'albumentations',
+        'pyfiglet',
+        'opencv-python',
+        'scipy',
+        'pandas',
+        'sklearn',
+        'wget',
+        'pillow',
+        'seaborn',
+        'matplotlib',
+        'requests',
+        'tqdm',
+        'h5py',
+        'jsonpickle',
+        'python-docx',
+        'tensorboard',
+        'tensorflow_probability==0.8.0',
+        'transformers'
+    ]
+    if os.name == "nt":
+        dependencies.append(
+            "pycocotools @ git+https://github.com/philferriere/cocoapi.git#egg=pycocotools&subdirectory=PythonAPI")
+    else:
+        dependencies.append('pycocotools-fix')
+    return dependencies
+
+
 setup(
-    entry_points={
-        "console_scripts": ["fastestimator = fastestimator.main:run"]
-    },
+    entry_points={"console_scripts": ["fastestimator = fastestimator.cli.main:run"]},
     name=get_name(),
     version=get_version(),
     description="Deep learning framework",
@@ -52,27 +80,6 @@ setup(
         "Programming Language :: Python :: 3", ],
 
     # Declare minimal set for installation
-    install_requires=[
-        'numpy',
-        'albumentations',
-        'pyfiglet',
-        'opencv-python',
-        'scipy',
-        'pandas',
-        'sklearn',
-        'wget',
-        'pillow',
-        'seaborn',
-        'matplotlib',
-        'requests',
-        'tqdm',
-        'h5py',
-        'pycocotools-fix',
-        'jsonpickle',
-        'python-docx',
-        'tensorboard',
-        'tensorflow_probability==0.8.0'
-    ],
+    install_requires=get_dependency(),
     # Declare extra set for installation
-    extras_require={}
-    )
+    extras_require={})

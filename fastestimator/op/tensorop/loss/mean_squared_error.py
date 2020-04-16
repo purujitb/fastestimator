@@ -12,29 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from typing import Union, Iterable, Callable, List, TypeVar, Dict, Any
+from typing import Any, Callable, Dict, Iterable, List, TypeVar, Union
 
 import tensorflow as tf
 import torch
 
 from fastestimator.backend.mean_squared_error import mean_squared_error
-from fastestimator.backend.reduce_loss import reduce_loss
+from fastestimator.backend.reduce_mean import reduce_mean
 from fastestimator.op.tensorop.tensorop import TensorOp
 
 Tensor = TypeVar('Tensor', tf.Tensor, torch.Tensor)
 
 
 class MeanSquaredError(TensorOp):
-    """Calculate mean squared error loss, the rest of the keyword argument will be passed to
-    tf.losses.MeanSquaredError
+    """Calculate the mean squared error loss between two tensors.
 
     Args:
-        y_true: ground truth label key
-        y_pred: prediction label key
-        inputs: A tuple or list like: [<y_true>, <y_pred>]
-        outputs: Where to store the computed loss value (not required under normal use cases)
-        mode: 'train', 'eval', 'test', or None
-        kwargs: Arguments to be passed along to the tf.losses constructor
+        inputs: A tuple or list like: [<y_true>, <y_pred>].
+        outputs: String key under which to store the computed loss.
+        mode: What mode(s) to execute this Op in. For example, "train", "eval", "test", or "infer". To execute
+            regardless of mode, pass None. To execute in all modes except for a particular one, you can pass an argument
+            like "!infer" or "!train".
     """
     def __init__(self,
                  inputs: Union[None, str, Iterable[str], Callable] = None,
@@ -48,5 +46,5 @@ class MeanSquaredError(TensorOp):
         y_pred, y_true = data
         loss = mean_squared_error(y_true=y_true, y_pred=y_pred)
         if self.average_loss:
-            loss = reduce_loss(loss)
+            loss = reduce_mean(loss)
         return loss

@@ -108,12 +108,5 @@ ENV/
 .pydevproject
 .vscode
 
-# tutorial output files
-/tutorial/outputs
-
-# for sphinx website develop
+# add docs
 /docs
-
-# nightly-build test artifact
-/test/apphub_scripts/**/*.txt
-/test/apphub_scripts/**/*.ipynb

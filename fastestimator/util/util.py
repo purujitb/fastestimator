@@ -65,6 +65,39 @@ STRING_TO_TF_DTYPE = {
     "float64": tf.float64
 }
 
+TENSOR_TO_NP_DTYPE = {
+    # Abstract types like 'float' and 'long' are intentionally not included here since they are never actually a
+    # tensor's dtype and they interfere with the finer-grained keys (torch.float intercepts torch.float32, for example)
+    None: None,
+    torch.float32: np.float32,
+    torch.float64: np.float64,
+    torch.float16: np.float16,
+    torch.uint8: np.uint8,
+    torch.int8: np.int8,
+    torch.int16: np.int16,
+    torch.int32: np.int32,
+    torch.int64: np.int64,
+    torch.bool: np.bool,
+    tf.float32: np.float32,
+    tf.float64: np.float64,
+    tf.float16: np.float16,
+    tf.uint8: np.uint8,
+    tf.int8: np.int8,
+    tf.int16: np.int16,
+    tf.int32: np.int32,
+    tf.int64: np.int64,
+    tf.bool: np.bool,
+    np.dtype('float32'): np.float32,
+    np.dtype('float64'): np.float64,
+    np.dtype('float16'): np.float16,
+    np.dtype('uint8'): np.uint8,
+    np.dtype('int8'): np.int8,
+    np.dtype('int16'): np.int16,
+    np.dtype('int32'): np.int32,
+    np.dtype('int64'): np.int64,
+    np.dtype('bool'): np.bool,
+}
+
 Tensor = TypeVar('Tensor', tf.Tensor, torch.Tensor)
 
 
@@ -218,7 +251,6 @@ class LogSplicer:
     def __enter__(self) -> None:
         self.log_file = open(self.log_path, 'a')
         self.stdout = sys.stdout
-        self.stderr = sys.stderr
         sys.stdout = self
 
     def __exit__(self, *exc: Tuple[Optional[Type], Optional[Exception], Optional[Any]]) -> None:
@@ -228,6 +260,10 @@ class LogSplicer:
     def write(self, output: str) -> None:
         self.log_file.write(output)
         self.stdout.write(output)
+
+    def flush(self) -> None:
+        self.stdout.flush()
+        self.log_file.flush()
 
 
 class Timer(ContextDecorator):
@@ -622,10 +658,10 @@ def show_image(im: Union[np.ndarray, Tensor],
         color = ["m", "r", "c", "g", "y", "b"][stack_depth % 6]
         for box in im:
             # Unpack the box, which may or may not have a label
-            x0 = int(box[0])
-            y0 = int(box[1])
-            width = int(box[2])
-            height = int(box[3])
+            x0 = float(box[0])
+            y0 = float(box[1])
+            width = float(box[2])
+            height = float(box[3])
             label = None if len(box) < 5 else str(box[4])
 
             # Don't draw empty boxes, or invalid box
@@ -653,12 +689,16 @@ def show_image(im: Union[np.ndarray, Tensor],
             im = im.permute(*channels)
         # image data
         im = to_number(im)
+        im_max = np.max(im)
+        im_min = np.min(im)
         if np.issubdtype(im.dtype, np.integer):
             # im is already in int format
             im = im.astype(np.uint8)
-        elif np.max(im) <= 1 and np.min(im) >= 0:  # im is [0,1]
+        elif 0 <= im_min <= im_max <= 1:  # im is [0,1]
             im = (im * 255).astype(np.uint8)
-        elif np.min(im) >= -1 and np.max(im) <= 1:  # im is [-1, 1]
+        elif -0.5 <= im_min < 0 < im_max <= 0.5:  # im is [-0.5, 0.5]
+            im = ((im + 0.5) * 255).astype(np.uint8)
+        elif -1 <= im_min < 0 < im_max <= 1:  # im is [-1, 1]
             im = ((im + 1) * 127.5).astype(np.uint8)
         else:  # im is in some arbitrary range, probably due to the Normalize Op
             ma = abs(np.max(im, axis=tuple([i for i in range(len(im.shape) - 1)]) if len(im.shape) > 2 else None))

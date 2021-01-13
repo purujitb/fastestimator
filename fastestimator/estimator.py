@@ -34,8 +34,9 @@ from fastestimator.schedule.schedule import Scheduler, get_current_items, get_si
 from fastestimator.summary.system import Summary, System
 from fastestimator.trace.io.best_model_saver import BestModelSaver
 from fastestimator.trace.io.model_saver import ModelSaver
+from fastestimator.trace.io.restore_wizard import RestoreWizard
 from fastestimator.trace.io.traceability import Traceability
-from fastestimator.trace.trace import EvalEssential, Logger, Trace, TrainEssential, sort_traces
+from fastestimator.trace.trace import EvalEssential, Logger, TestEssential, Trace, TrainEssential, sort_traces
 from fastestimator.util.data import Data
 from fastestimator.util.traceability_util import traceable
 from fastestimator.util.util import Suppressor, draw, to_list, to_set
@@ -133,8 +134,15 @@ class Estimator:
         self.traces_in_use = [trace for trace in self.traces]
         if self.system.log_steps is not None:
             self.traces_in_use.append(Logger())
+        # Look for any monitor names which should be automagically added.
+        trace_outputs = set()
+        extra_monitor_keys = set()
+        for trace in sort_traces(get_current_items(self.traces_in_use, run_modes=run_modes)):
+            trace_outputs.update(trace.outputs)
+            extra_monitor_keys.update(trace.fe_monitor_names - trace_outputs)
+        # Add the essential traces
         if "train" in run_modes:
-            self.traces_in_use.insert(0, TrainEssential(monitor_names=self.monitor_names))
+            self.traces_in_use.insert(0, TrainEssential(monitor_names=self.monitor_names.union(extra_monitor_keys)))
             no_save_warning = True
             for trace in get_current_items(self.traces_in_use, run_modes=run_modes):
                 if isinstance(trace, (ModelSaver, BestModelSaver)):
@@ -142,7 +150,9 @@ class Estimator:
             if no_save_warning:
                 print("FastEstimator-Warn: No ModelSaver Trace detected. Models will not be saved.")
         if "eval" in run_modes and "eval" in self.pipeline.get_modes():
-            self.traces_in_use.insert(1, EvalEssential(monitor_names=self.monitor_names))
+            self.traces_in_use.insert(1, EvalEssential(monitor_names=self.monitor_names.union(extra_monitor_keys)))
+        if "test" in run_modes and "test" in self.pipeline.get_modes():
+            self.traces_in_use.insert(0, TestEssential(monitor_names=self.monitor_names.union(extra_monitor_keys)))
         # insert system instance to trace
         for trace in get_current_items(self.traces_in_use, run_modes=run_modes):
             trace.system = self.system
@@ -237,6 +247,10 @@ class Estimator:
         try:
             self._run_traces_on_begin(traces=all_traces)
             if "train" in run_modes or "eval" in run_modes:
+                # If the training is re-starting from a restore wizard, it should re-run the last eval epoch
+                if self.system.epoch_idx > 0 and "eval" in self.pipeline.get_modes(epoch=self.system.epoch_idx):
+                    self.system.mode = "eval"
+                    self._run_epoch()
                 for self.system.epoch_idx in range(self.system.epoch_idx + 1, self.system.total_epochs + 1):
                     if "train" in self.pipeline.get_modes(epoch=self.system.epoch_idx):
                         self.system.mode = "train"
@@ -339,8 +353,19 @@ class Estimator:
             traces: List of traces.
         """
         data = Data()
+        restore = None
         for trace in traces:
+            # Delay RestoreWizard until the end so that it can overwrite everyone's on_begin methods
+            if isinstance(trace, RestoreWizard):
+                restore = trace
+                continue
+            # Restore does need to run before the logger though
+            if isinstance(trace, Logger) and restore:
+                restore.on_begin(data)
+                restore = None
             trace.on_begin(data)
+        if restore:
+            restore.on_begin(data)
         self._check_early_exit()
 
     def _run_traces_on_epoch_begin(self, traces: Iterable[Trace]) -> None:

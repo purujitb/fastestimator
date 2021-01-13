@@ -1,4 +1,4 @@
-FROM tensorflow/tensorflow:2.1.0-gpu-py3
+FROM tensorflow/tensorflow:2.3.1-gpu
 
 RUN apt-get update
 
@@ -7,20 +7,33 @@ RUN apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     libsm6 \
     libxrender1 \
-    libxext6
+    libxext6 \
+    git
 
-# Pydot requirement
-RUN apt-get install -y --no-install-recommends \
+# Traceability requirement
+ENV DEBIAN_FRONTEND noninteractive
+RUN apt-get install -y \
     graphviz \
     texlive-latex-base \
     texlive-latex-extra
 
-# git requirement
-RUN apt-get install -y --no-install-recommends \
-    git
+# upgrade essential packages
+RUN pip install --upgrade pip setuptools
 
+# nightly test related packages
 RUN pip install --no-cache-dir \
-    jupyter \
+    ipython \
+    ipykernel \
+    ipywidgets \
     papermill
+RUN ipython kernel install --user --name nightly_build
 
-RUN pip install git+https://github.com/fastestimator/fastestimator.git
+# GPU cleaning requirement
+RUN apt-get install -y lsof
+
+# backend dependencies
+RUN pip install torch==1.6.0+cu101 torchvision==0.7.0+cu101 -f https://download.pytorch.org/whl/torch_stable.html
+
+# install FastEstimator
+ARG InstallFE=True
+RUN if [ $InstallFE = "True" ]; then pip install git+https://github.com/fastestimator/fastestimator.git; fi

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import multiprocessing as mp
 import os
 import random
 import time
@@ -26,8 +27,9 @@ from torch.utils.data.dataloader import default_collate
 
 from fastestimator.dataset.batch_dataset import BatchDataset
 from fastestimator.dataset.op_dataset import OpDataset
+from fastestimator.op.numpyop.meta.one_of import OneOf
+from fastestimator.op.numpyop.meta.sometimes import Sometimes
 from fastestimator.op.numpyop.numpyop import NumpyOp, forward_numpyop
-from fastestimator.op.op import LambdaOp
 from fastestimator.schedule.schedule import Scheduler, get_current_items
 from fastestimator.util.traceability_util import traceable
 from fastestimator.util.util import pad_batch, to_list, to_set
@@ -61,7 +63,7 @@ class Pipeline:
                  train_data: Union[None, DataSource, Scheduler[DataSource]] = None,
                  eval_data: Union[None, DataSource, Scheduler[DataSource]] = None,
                  test_data: Union[None, DataSource, Scheduler[DataSource]] = None,
-                 batch_size: Union[None, int, Scheduler[int]] = None,
+                 batch_size: Union[None, int, Scheduler[Union[int, Dict[str, int]]], Dict[str, int]] = None,
                  ops: Union[None, NumpyOp, Scheduler[NumpyOp], List[Union[NumpyOp, Scheduler[NumpyOp]]]] = None,
                  num_process: Optional[int] = None,
                  drop_last: bool = False,
@@ -70,7 +72,12 @@ class Pipeline:
         self.data = {x: y for (x, y) in zip(["train", "eval", "test"], [train_data, eval_data, test_data]) if y}
         self.batch_size = batch_size
         self.ops = to_list(ops)
-        self.num_process = num_process if num_process is not None else os.cpu_count() if os.name != 'nt' else 0
+        if mp.get_start_method(allow_none=True) is None and os.name != 'nt':
+            mp.set_start_method('fork')
+        if mp.get_start_method(allow_none=True) != 'fork':
+            print("FastEstimator-Warn: Pipeline multiprocessing is disabled. OS must support the 'fork' start method.")
+            num_process = 0
+        self.num_process = num_process if num_process is not None else os.cpu_count()
         self.drop_last = drop_last
         self.pad_value = pad_value
         self.collate_fn = collate_fn
@@ -111,10 +118,15 @@ class Pipeline:
         if isinstance(dataset, Dataset):
             # batch_size check
             for batch_size in get_current_items(to_list(self.batch_size)):
-                assert isinstance(batch_size, int), "unsupported batch_size format: {}".format(type(batch_size))
+                assert isinstance(batch_size, (int, dict)), "unsupported batch_size format: {}".format(type(batch_size))
+                if isinstance(batch_size, dict):
+                    assert all([key in {"train", "eval", "test", "infer"} for key in batch_size.keys()]), \
+                        "batch size dictionaries must be keyed on mode"
+                    assert all([isinstance(val, int) for val in batch_size.values()]), \
+                        "batch size dictionary values must be integers"
             # ops check
             for op in get_current_items(self.ops):
-                assert isinstance(op, (NumpyOp, LambdaOp)), "unsupported op format, must provide NumpyOp in Pipeline"
+                assert isinstance(op, NumpyOp), "unsupported op format, must provide NumpyOp in Pipeline"
             # num_process check
             assert isinstance(self.num_process, int), "number of processes must be an integer"
             return True
@@ -177,33 +189,58 @@ class Pipeline:
 
             data_len = len(loader.dataset.dataset)
             if self.batch_size:
-                log_interval = log_interval * self.batch_size
+                batch_size = self.batch_size.get_current_value(epoch) if isinstance(self.batch_size,
+                                                                                    Scheduler) else self.batch_size
+                batch_size = batch_size[mode] if isinstance(batch_size, dict) else batch_size
+                log_interval = log_interval * batch_size
 
-            print("\nBreakdown of time taken by Pipeline Operations:")
+            print("\nBreakdown of time taken by Pipeline Operations ({} epoch {})".format(mode, epoch))
             for _ in range(log_interval):
                 index = np.random.randint(data_len)
                 items = deepcopy(loader.dataset.dataset[index])
                 if isinstance(loader.dataset.dataset, BatchDataset):
-                    unique_list = []
+                    # BatchDataset may randomly sample the same elements multiple times, so need to avoid reprocessing
+                    unique_samples = set()
                     for item in items:
-                        if id(item) not in unique_list:
+                        if id(item) not in unique_samples:
                             for i, op in enumerate(op_list):
                                 start = time.perf_counter()
-                                forward_numpyop([op], item, loader.dataset.mode)
+                                forward_numpyop([op], item, {'mode': loader.dataset.mode})
                                 duration = time.perf_counter() - start
                                 duration_list[i] += duration
-                            unique_list.append(id(item))
+                            unique_samples.add(id(item))
                 else:
                     for i, op in enumerate(op_list):
                         start = time.perf_counter()
-                        forward_numpyop([op], items, loader.dataset.mode)
+                        forward_numpyop([op], items, {'mode': loader.dataset.mode})
                         duration = time.perf_counter() - start
                         duration_list[i] += duration
 
             total_time = np.sum(duration_list)
+            op_names = ["Op"]
+
+            for op in op_list:
+                if isinstance(op, Sometimes) and op.op:
+                    op_names.append(op.__class__.__name__ + " (" + op.op.__class__.__name__ + ")")
+                elif isinstance(op, OneOf) and op.ops:
+                    op_names.append(op.__class__.__name__ + " (" +
+                                    ", ".join([sub_op.__class__.__name__ for sub_op in op.ops]) + ")")
+                else:
+                    op_names.append(op.__class__.__name__)
+
+            max_op_len = max(len(op_name) for op_name in op_names)
+            max_in_len = max([len(", ".join(op.inputs)) for op in op_list] + [len("Inputs")])
+            max_out_len = max([len(", ".join(op.outputs)) for op in op_list] + [len("Outputs")])
+            print("{}: {}: {}: {}".format("Op".ljust(max_op_len + 1),
+                                          "Inputs".ljust(max_in_len + 1),
+                                          "Outputs".ljust(max_out_len + 1),
+                                          "Time".rjust(5)))
+            print("-" * (max_op_len + max_in_len + max_out_len + 15))
             for i, op in enumerate(op_list):
-                print(" - {}: Time Consumption: {:.2f}%".format(op.__class__.__name__,
-                                                                100 * duration_list[i] / total_time))
+                print("{}: {}: {}: {:5.2f}%".format(op_names[i + 1].ljust(max_op_len + 1),
+                                                    ", ".join(op.inputs).ljust(max_in_len + 1),
+                                                    ", ".join(op.outputs).ljust(max_out_len + 1),
+                                                    100 * duration_list[i] / total_time))
 
     def get_scheduled_items(self, mode: str) -> List[Any]:
         """Get a list of items considered for scheduling.
@@ -248,7 +285,7 @@ class Pipeline:
         """
         data = deepcopy(data)
         ops = get_current_items(self.ops, mode, epoch)
-        forward_numpyop(ops, data, mode)
+        forward_numpyop(ops, data, {'mode': mode})
         for key, value in data.items():
             data[key] = np.expand_dims(value, 0)
         return data
@@ -299,6 +336,8 @@ class Pipeline:
             batch_size = self.batch_size
             if isinstance(batch_size, Scheduler):
                 batch_size = batch_size.get_current_value(epoch)
+            if isinstance(batch_size, dict):
+                batch_size = batch_size[mode]
             # batch dataset
             if isinstance(data, BatchDataset):
                 data.pad_value = self.pad_value
@@ -310,12 +349,13 @@ class Pipeline:
             if collate_fn is None and self.pad_value is not None:
                 collate_fn = self._pad_batch_collate
             op_dataset = OpDataset(data, get_current_items(self.ops, mode, epoch), mode)
+            batch_size = None if isinstance(data, BatchDataset) else batch_size
             data = DataLoader(op_dataset,
-                              batch_size=None if isinstance(data, BatchDataset) else batch_size,
+                              batch_size=batch_size,
                               shuffle=False if isinstance(data, BatchDataset) else shuffle,
                               sampler=RandomSampler(op_dataset) if isinstance(data, BatchDataset) and shuffle else None,
                               num_workers=self.num_process,
-                              drop_last=self.drop_last,
+                              drop_last=False if batch_size is None else self.drop_last,
                               worker_init_fn=lambda _: np.random.seed(random.randint(0, 2**32 - 1)),
                               collate_fn=collate_fn)
         return data

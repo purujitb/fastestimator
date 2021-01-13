@@ -16,6 +16,7 @@ import time
 from collections import deque
 from typing import Iterable, List, Optional, Set, Union
 
+from natsort import humansorted
 import numpy as np
 
 from fastestimator.backend.get_lr import get_lr
@@ -68,6 +69,9 @@ class Trace:
     inputs: List[str]
     outputs: List[str]
     mode: Set[str]
+    # You can put keys in here to have them automatically added to EvalEssential without the user having to manually add
+    # them to the Estimator monitor_names. See BestModelSaver for an example.
+    fe_monitor_names: Set[str]
 
     def __init__(self,
                  inputs: Union[None, str, Iterable[str]] = None,
@@ -76,6 +80,7 @@ class Trace:
         self.inputs = to_list(inputs)
         self.outputs = to_list(outputs)
         self.mode = parse_modes(to_set(mode))
+        self.fe_monitor_names = set()  # The use-case here is rare enough that we don't want to add this to the init sig
 
     def on_begin(self, data: Data) -> None:
         """Runs once at the beginning of training or testing.
@@ -207,6 +212,35 @@ class EvalEssential(Trace):
 
 
 @traceable()
+class TestEssential(Trace):
+    """A trace to collect important information during evaluation.
+
+    Please don't add this trace into an estimator manually. FastEstimator will add it automatically.
+
+    Args:
+        monitor_names: Any keys which should be collected over the course of an test epoch.
+    """
+    def __init__(self, monitor_names: Set[str]) -> None:
+        super().__init__(mode="test", inputs=monitor_names)
+        self.test_results = None
+
+    def on_epoch_begin(self, data: Data) -> None:
+        self.test_results = None
+
+    def on_batch_end(self, data: Data) -> None:
+        if self.test_results is None:
+            self.test_results = {key: [data[key]] for key in self.inputs if key in data}
+        else:
+            for key in self.inputs:
+                if key in data:
+                    self.test_results[key].append(data[key])
+
+    def on_epoch_end(self, data: Data) -> None:
+        for key, value_list in self.test_results.items():
+            data.write_with_log(key, np.mean(np.array(value_list), axis=0))
+
+
+@traceable()
 class Logger(Trace):
     """A Trace that prints log messages.
 
@@ -221,8 +255,8 @@ class Logger(Trace):
             self._print_message("FastEstimator-Start: step: {}; ".format(start_step), data)
 
     def on_batch_end(self, data: Data) -> None:
-        if self.system.mode == "train" and self.system.log_steps and (
-                self.system.global_step % self.system.log_steps == 0 or self.system.global_step == 1):
+        if self.system.mode == "train" and self.system.log_steps and (self.system.global_step % self.system.log_steps
+                                                                      == 0 or self.system.global_step == 1):
             self._print_message("FastEstimator-Train: step: {}; ".format(self.system.global_step), data)
 
     def on_epoch_end(self, data: Data) -> None:
@@ -249,13 +283,16 @@ class Logger(Trace):
         if log_epoch:
             log_message += "epoch: {}; ".format(self.system.epoch_idx)
             self.system.write_summary('epoch', self.system.epoch_idx)
-        for key, val in data.read_logs().items():
+        deferred = []
+        for key, val in humansorted(data.read_logs().items(), key=lambda x: x[0]):
             val = to_number(val)
             self.system.write_summary(key, val)
             if val.size > 1:
-                log_message += "\n{}:\n{};".format(key, np.array2string(val, separator=','))
+                deferred.append("\n{}:\n{};".format(key, np.array2string(val, separator=',')))
             else:
                 log_message += "{}: {}; ".format(key, str(val))
+        for elem in deferred:
+            log_message += elem
         print(log_message)
 
 
@@ -294,7 +331,7 @@ def sort_traces(traces: List[Trace], available_outputs: Optional[Set[str]] = Non
         trace = trace_deque.popleft()
         ins = set(trace.inputs)
         outs = set(trace.outputs)
-        if not ins or isinstance(trace, (TrainEssential, EvalEssential)):
+        if not ins or isinstance(trace, (TrainEssential, EvalEssential, TestEssential)):
             sorted_traces.append(trace)
             available_outputs |= outs
         elif "*" in ins:

@@ -55,7 +55,7 @@ class EccLeNet(torch.nn.Module):
         x = fn.max_pool2d(x, self.pool_kernel)
         x = fn.relu(self.conv3(x))
         x = x.view(x.size(0), -1)
-        x = [head(x) for head in self.heads]
+        x = [fn.relu(head(x)) for head in self.heads]
         x = self.outputs(x)
         return x
 
@@ -94,8 +94,8 @@ def get_estimator(epsilon=0.04,
     ])
     # step 3
     traces = [
-        Accuracy(true_key="y", pred_key="y_pred", output_name="base accuracy"),
-        Accuracy(true_key="y", pred_key="y_pred_adv", output_name="adversarial accuracy"),
+        Accuracy(true_key="y", pred_key="y_pred", output_name="base_accuracy"),
+        Accuracy(true_key="y", pred_key="y_pred_adv", output_name="adversarial_accuracy"),
         BestModelSaver(model=model, save_dir=save_dir, metric="avg_ce", save_best_mode="min", load_best_final=True)
     ]
     estimator = fe.Estimator(pipeline=pipeline,

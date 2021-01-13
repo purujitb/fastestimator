@@ -2,22 +2,51 @@ def IMAGE_TAG="$BUILD_TAG".toLowerCase()
 
 pipeline {
     agent {label 'master'}
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+    }
     environment {
         IMAGE_TAG="$IMAGE_TAG"
+        CODACY_PROJECT_TOKEN=credentials('codacy_project_api')
     }
     stages {
         stage('PR-test') {
             steps {
                 script {
-                    def customImage = docker.build("$IMAGE_TAG", "--no-cache - < docker/nightly/Dockerfile.cpu")
+                    def customImage = docker.build("$IMAGE_TAG", "--no-cache --build-arg InstallFE=False - < docker/nightly/Dockerfile.cpu")
                     try {
                         customImage.inside('-u root') {
-                            sh 'pip install --no-cache-dir -e .'
-                            sh 'python test/run_pr_test.py'
+                            sh 'pip install --no-cache-dir .'
+                            sh 'pip install coverage'
+                            sh 'coverage run --source fastestimator -m unittest test.run_pr_test'
+                            sh 'coverage html'
+                            sh 'coverage xml'
                         }
                     }
                     finally {
                         sh 'docker rmi "$IMAGE_TAG"'
+                    }
+                }
+            }
+        }
+        stage('Host html') {
+            steps{
+                publishHTML (target :
+                    [allowMissing: true,
+                     alwaysLinkToLastBuild: true,
+                     keepAll: true,
+                     reportDir: 'htmlcov',
+                     reportFiles: 'index.html',
+                     reportName: 'Code Coverage Report',
+                     reportTitles: 'Code Coverage Report'])
+            }
+        }
+
+        stage('Update Codacy'){
+            steps{
+                script {
+                    if (!IMAGE_TAG.contains("-pr-")){
+                        sh '/root/.cache/codacy/codacy-coverage-reporter report -r coverage.xml'
                     }
                 }
             }

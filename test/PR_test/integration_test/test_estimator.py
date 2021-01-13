@@ -1,3 +1,17 @@
+# Copyright 2020 The FastEstimator Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 import unittest
 from io import StringIO
 
@@ -99,7 +113,7 @@ class TestEstimatorPrepareTraces(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         train_data, eval_data = mnist.load_data()
-        cls.pipeline = fe.Pipeline(train_data=train_data, eval_data=eval_data)
+        cls.pipeline = fe.Pipeline(train_data=train_data, eval_data=eval_data, test_data=eval_data)
 
         model = fe.build(model_fn=LeNetTf, optimizer_fn="adam")
 
@@ -109,7 +123,7 @@ class TestEstimatorPrepareTraces(unittest.TestCase):
             UpdateOp(model=model, loss_name="ce")
         ])
 
-    def test_estimator_prepare_traces_check_add_trace(self):
+    def test_estimator_prepare_traces_check_add_trace_fit_mode(self):
         est = fe.Estimator(pipeline=self.pipeline, network=self.network, epochs=1)
         est._prepare_traces({"train", "eval"})
 
@@ -122,11 +136,21 @@ class TestEstimatorPrepareTraces(unittest.TestCase):
         with self.subTest("check EvalEssential"):
             self.assertIsInstance(est.traces_in_use[1], fe.trace.EvalEssential)
 
+    def test_estimator_prepare_traces_check_add_trace_test_mode(self):
+        est = fe.Estimator(pipeline=self.pipeline, network=self.network, epochs=1)
+        est._prepare_traces({"test"})
+
+        with self.subTest("check Logger"):
+            self.assertIsInstance(est.traces_in_use[-1], fe.trace.Logger)
+
+        with self.subTest("check TestEssential"):
+            self.assertIsInstance(est.traces_in_use[0], fe.trace.TestEssential)
+
     def test_estimator_prepare_traces_check_all_trace_have_system(self):
         est = fe.Estimator(pipeline=self.pipeline, network=self.network, epochs=1)
-        est._prepare_traces({"train", "eval"})
+        est._prepare_traces({"train", "eval", "test"})
 
-        for trace in get_current_items(est.traces_in_use, run_modes={"train", "eval"}):
+        for trace in get_current_items(est.traces_in_use, run_modes={"train", "eval", "test"}):
             self.assertEqual(trace.system, est.system)
 
 
@@ -213,7 +237,7 @@ class TestEstimatorConfigureTensor(unittest.TestCase):
         batch = est._configure_tensor(loader, batch)
         self.assertIsInstance(batch["x"], torch.Tensor)
 
-    def test_estimator_configure_tensor_tf_dataset_torch_model(self):
+    def test_estimator_configure_tensor_tf_dataset_tf_model(self):
         loader = get_sample_torch_dataloader()
         pipeline = fe.Pipeline(train_data=loader)
         model = fe.build(model_fn=LeNetTf, optimizer_fn="adam")

@@ -1,3 +1,17 @@
+# Copyright 2020 The FastEstimator Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 import unittest
 from copy import deepcopy
 
@@ -21,6 +35,7 @@ class UnknownCompiledModel:
     def __init__(self, model):
         self.model = model
         self.fe_compiled = True
+        self.model_name = 'unk'
 
 
 class SampleNumpyOp(NumpyOp):
@@ -31,6 +46,11 @@ class SampleNumpyOp(NumpyOp):
 class SampleTensorOp(TensorOp):
     def forward(self, data, state):
         return data
+
+
+class PlusOneNumpyOp(NumpyOp):
+    def forward(self, data, state):
+        return data + 1
 
 
 def get_torch_lenet_model_weight(model):
@@ -52,6 +72,13 @@ def get_tf_model_weight(model):
     return weight
 
 
+def get_torch_one_layer_model_weight(model):
+    weight = []
+    weight.append(deepcopy(model.fc1.weight.data.numpy()))
+
+    return weight
+
+
 class TestNetworkCollectModel(unittest.TestCase):
     """This test has dependency on:
     * fe.schedule.schedule.get_current_items
@@ -67,7 +94,6 @@ class TestNetworkCollectModel(unittest.TestCase):
                 model = fe.build(model_fn=model_fn, optimizer_fn=None)
                 model2 = fe.build(model_fn=model_fn, optimizer_fn=None)
                 ops = [
-                    SampleNumpyOp(inputs="x", outputs="x"),
                     SampleTensorOp(inputs="x", outputs="x"),
                     ModelOp(model=model, inputs="x", outputs="y2"),
                     UpdateOp(model=model2, loss_name="ce")
@@ -79,7 +105,6 @@ class TestNetworkCollectModel(unittest.TestCase):
 
     def test_network_collect_model_no_model_op_and_update_op(self):
         ops = [
-            SampleNumpyOp(inputs="x", outputs="x"),
             SampleTensorOp(inputs="x", outputs="x"),
         ]
 
@@ -128,7 +153,6 @@ class TestNetworkNetwork(unittest.TestCase):
 
     def test_network_network_case_could_not_work(self):
         ops_dict = {
-            "no model": [SampleTensorOp(inputs="x", outputs="y")],
             "mixed model type": [
                 ModelOp(model=self.torch_model, inputs="x", outputs="y"),
                 ModelOp(model=self.tf_model, inputs="x", outputs="y")
@@ -140,7 +164,7 @@ class TestNetworkNetwork(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     network = fe.Network(ops=ops)
 
-    def test_network_network_unkown_compiled_model(self):
+    def test_network_network_unknown_compiled_model(self):
         with self.assertRaises(ValueError):
             network = fe.Network(ops=[ModelOp(model=self.unknown_model, inputs="x", outputs="y")])
 
@@ -374,11 +398,13 @@ class TestNetworkTransform(unittest.TestCase):
     def test_network_transform_one_layer_model_tf(self):
         model = fe.build(model_fn=one_layer_tf_model, optimizer_fn="adam")
         weight = get_tf_model_weight(model)
-        network = fe.Network(ops=[
-            ModelOp(model=model, inputs="x", outputs="y_pred"),
-            MeanSquaredError(inputs=("y_pred", "y"), outputs="ce"),
-            UpdateOp(model=model, loss_name="ce")
-        ])
+        network = fe.Network(
+            ops=[
+                ModelOp(model=model, inputs="x", outputs="y_pred"),
+                MeanSquaredError(inputs=("y_pred", "y"), outputs="ce"),
+                UpdateOp(model=model, loss_name="ce")
+            ],
+            pops=PlusOneNumpyOp(inputs="y_pred", outputs="y_pred_processed"))
         batch = {"x": np.array([[1, 1, 1]]), "y": np.array([[1]])}
         batch = network.transform(data=batch, mode="train")
 
@@ -386,11 +412,49 @@ class TestNetworkTransform(unittest.TestCase):
             ans = np.array([[6]], dtype=np.float32)  # 1*1 + 1*2 + 1*3
             self.assertTrue(np.array_equal(batch["y_pred"].numpy(), ans))
 
+        with self.subTest("postprocessing y_pred check"):
+            ans = np.array([[7]], dtype=np.float32)  # 1*1 + 1*2 + 1*3 + 1
+            self.assertTrue(np.array_equal(batch["y_pred_processed"], ans))
+
         with self.subTest("output ce check"):
             self.assertEqual(batch["ce"].numpy(), 25)  # (6-1)^2
 
         with self.subTest("check whether model weight changed"):
             weight2 = get_tf_model_weight(model)
+            self.assertFalse(is_equal(weight, weight2))
+
+    def test_network_transform_one_layer_model_torch(self):
+        model = fe.build(model_fn=OneLayerTorchModel, optimizer_fn="adam")
+        weight = get_torch_one_layer_model_weight(model)
+        network = fe.Network(
+            ops=[
+                ModelOp(model=model, inputs="x", outputs="y_pred"),
+                MeanSquaredError(inputs=("y_pred", "y"), outputs="ce"),
+                UpdateOp(model=model, loss_name="ce")
+            ],
+            pops=PlusOneNumpyOp(inputs="y_pred", outputs="y_pred_processed"))
+        batch = {
+            "x": np.array([[
+                1,
+                1,
+                1,
+            ]], dtype=np.float32), "y": np.array([[1]], dtype=np.float32)
+        }
+        batch = network.transform(data=batch, mode="train")
+
+        with self.subTest("output y_pred check"):
+            ans = np.array([[6]], dtype=np.float32)  # 1*1 + 1*2 + 1*3
+            self.assertTrue(np.array_equal(batch["y_pred"].numpy(), ans))
+
+        with self.subTest("postprocessing y_pred check"):
+            ans = np.array([[7]], dtype=np.float32)  # 1*1 + 1*2 + 1*3 + 1
+            self.assertTrue(np.array_equal(batch["y_pred_processed"], ans))
+
+        with self.subTest("output ce check"):
+            self.assertEqual(batch["ce"].numpy(), 25)  # (6-1)^2
+
+        with self.subTest("check whether model weight changed"):
+            weight2 = get_torch_one_layer_model_weight(model)
             self.assertFalse(is_equal(weight, weight2))
 
     def test_network_transform_lenet_tf(self):

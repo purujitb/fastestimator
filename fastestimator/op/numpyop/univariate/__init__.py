@@ -15,6 +15,7 @@
 # see a complete list of effects in albumentation page: https://albumentations-demo.herokuapp.com
 from fastestimator.op.numpyop.univariate.binarize import Binarize
 from fastestimator.op.numpyop.univariate.blur import Blur
+from fastestimator.op.numpyop.univariate.calibate import Calibrate
 from fastestimator.op.numpyop.univariate.channel_dropout import ChannelDropout
 from fastestimator.op.numpyop.univariate.channel_shuffle import ChannelShuffle
 from fastestimator.op.numpyop.univariate.channel_transpose import ChannelTranspose
@@ -26,6 +27,7 @@ from fastestimator.op.numpyop.univariate.expand_dims import ExpandDims
 from fastestimator.op.numpyop.univariate.from_float import FromFloat
 from fastestimator.op.numpyop.univariate.gaussian_blur import GaussianBlur
 from fastestimator.op.numpyop.univariate.gaussian_noise import GaussianNoise
+from fastestimator.op.numpyop.univariate.hadamard import Hadamard
 from fastestimator.op.numpyop.univariate.hue_saturation_value import HueSaturationValue
 from fastestimator.op.numpyop.univariate.image_compression import ImageCompression
 from fastestimator.op.numpyop.univariate.invert_img import InvertImg

@@ -1,8 +1,23 @@
+# Copyright 2020 The FastEstimator Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 import os
 import pickle
 import unittest
 import urllib.request
 import warnings
+
 
 def ping(host):
     try:
@@ -31,14 +46,4 @@ class TestData(unittest.TestCase):
                         self.assertTrue(ping(url))
             else:
                 with self.subTest('Check if {} url reachable'.format(key)):
-                    # ============ temporary skip cub200 ====================
-                    if key == 'cub200_annotations' or key == 'cub200_images':
-                        if not ping(value):
-                            warnings.warn("{} url is not reachable, but we give it a pass".format(key))
-                        else:
-                            warnings.warn("{} url is now reachable, please remove the temporary skip in the unit \
-                                           test".format(key))
-                        self.assertTrue(True)
-                        continue
-                    # =======================================================
                     self.assertTrue(ping(value))

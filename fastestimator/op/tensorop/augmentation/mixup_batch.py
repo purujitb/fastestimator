@@ -12,57 +12,65 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from typing import Any, Dict, Iterable, List, Optional, TypeVar, Union
 
 import tensorflow as tf
 import tensorflow_probability as tfp
 import torch
 
-from fastestimator.op.tensorop import TensorOp
+from fastestimator.backend.maximum import maximum
+from fastestimator.backend.reshape import reshape
+from fastestimator.backend.roll import roll
+from fastestimator.op.tensorop.tensorop import TensorOp
+
+Tensor = TypeVar('Tensor', tf.Tensor, torch.Tensor)
 
 
 class MixUpBatch(TensorOp):
-    """ This class should be used in conjunction with MixUpLoss to perform mix-up training, which helps to reduce
-    over-fitting, stabilize GAN training, and against adversarial attacks (https://arxiv.org/abs/1710.09412)
+    """MixUp augmentation for tensors.
+
+    This class should be used in conjunction with MixLoss to perform mix-up training, which helps to reduce
+    over-fitting, stabilize GAN training, and against adversarial attacks (https://arxiv.org/abs/1710.09412).
 
     Args:
-        inputs: key of the input to be mixed up
-        outputs: key to store the mixed-up input
-        mode: what mode to execute in. Probably 'train'
-        alpha: the alpha value defining the beta distribution to be drawn from during training
-    """
-    def __init__(self, inputs=None, outputs=None, mode=None, alpha=1.0, framework='tf'):
-        assert alpha > 0, "Mixup alpha value must be greater than zero"
-        super().__init__(inputs=inputs, outputs=outputs, mode=mode)
+        inputs: Key of the input to be mixed up.
+        outputs: Key to store the mixed-up outputs.
+        mode: What mode to execute in. Probably 'train'.
+        alpha: The alpha value defining the beta distribution to be drawn from during training.
+        shared_beta: Sample a single beta for a batch or element wise beta for each image.
 
+    Raises:
+        AssertionError: If input arguments are invalid.
+    """
+    def __init__(self,
+                 inputs: Union[str, Iterable[str]],
+                 outputs: Iterable[str],
+                 mode: Union[None, str, Iterable[str]] = 'train',
+                 alpha: float = 1.0,
+                 shared_beta: bool = True):
+        assert alpha > 0, "MixUp alpha value must be greater than zero"
+        super().__init__(inputs=inputs, outputs=outputs, mode=mode)
+        assert len(self.outputs) == len(self.inputs) + 1, "MixUpBatch requires 1 more output than inputs"
+        self.alpha = alpha
+        self.beta = None
+        self.shared_beta = shared_beta
+        self.in_list, self.out_list = True, True
+
+    def build(self, framework: str, device: Optional[torch.device] = None) -> None:
         if framework == 'tf':
-            self.alpha = tf.constant(alpha)
             self.beta = tfp.distributions.Beta(self.alpha, self.alpha)
         elif framework == 'torch':
-            self.alpha = torch.FloatTensor(self.alpha)
             self.beta = torch.distributions.beta.Beta(self.alpha, self.alpha)
         else:
             raise ValueError("unrecognized framework: {}".format(framework))
 
-    def forward(self, data, state):
-        """ Forward method to perform mixup batch augmentation
-
-        Args:
-            data: Batch data to be augmented
-            state: Information about the current execution context.
-
-        Returns:
-            Mixed-up batch data
-        """
-        iterdata = data if isinstance(data, list) else list(data) if isinstance(data, tuple) else [data]
-        lam = self.beta.sample()
-        # Could do random mix-up using tf.gather() on a shuffled index list, but batches are already randomly ordered,
-        # so just need to roll by 1 to get a random combination of inputs. This also allows MixUpLoss to easily compute
-        # the corresponding Y values
-        if tf.is_tensor(data):
-            mix = [lam * dat + (1.0 - lam) * tf.roll(dat, shift=1, axis=0) for dat in iterdata]
-        elif isinstance(data, torch.Tensor):
-            mix = [lam * dat + (1.0 - lam) * torch.roll(dat, shift=1, dims=0) for dat in iterdata]
+    def forward(self, data: List[Tensor], state: Dict[str, Any]) -> List[Tensor]:
+        if self.shared_beta:
+            lam = self.beta.sample()
         else:
-            raise ValueError("unrecognized data format: {}".format(type(data)))
-
+            lam = self.beta.sample(sample_shape=(data[0].shape[0], ))
+            shape = [-1] + [1] * (len(data[0].shape) - 1)
+            lam = reshape(lam, shape)
+        lam = maximum(lam, (1 - lam))
+        mix = [lam * elem + (1.0 - lam) * roll(elem, shift=1, axis=0) for elem in data]
         return mix + [lam]

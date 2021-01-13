@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List
 
 import numpy as np
 
@@ -24,17 +24,31 @@ from fastestimator.util.traceability_util import traceable
 class Sometimes(NumpyOp):
     """Perform a NumpyOp with a given probability.
 
+    Note that Sometimes should not be used to wrap an op whose output key(s) do not already exist in the data
+    dictionary. This would result in a problem when future ops / traces attempt to reference the output key, but
+    Sometimes declined to generate it. If you want to create a default value for a new key, simply use a LambdaOp before
+    invoking the Sometimes.
+
     Args:
         numpy_op: The operator to be performed.
         prob: The probability of execution, which should be in the range: [0-1).
     """
     def __init__(self, numpy_op: NumpyOp, prob: float = 0.5) -> None:
-        super().__init__(inputs=numpy_op.inputs, outputs=numpy_op.outputs, mode=numpy_op.mode)
-        self.numpy_op = numpy_op
+        # We're going to try to collect any missing output keys from the data dictionary so that they don't get
+        # overridden when Sometimes chooses not to execute.
+        inps = set(numpy_op.inputs)
+        outs = set(numpy_op.outputs)
+        self.extra_inputs = list(outs - inps)  # Used by traceability
+        self.inp_idx = len(numpy_op.inputs)
+        super().__init__(inputs=numpy_op.inputs + self.extra_inputs, outputs=numpy_op.outputs, mode=numpy_op.mode)
+        # Note that in_list and out_list will always be true
+        self.op = numpy_op
         self.prob = prob
 
-    def forward(self, data: Union[np.ndarray, List[np.ndarray]],
-                state: Dict[str, Any]) -> Union[np.ndarray, List[np.ndarray]]:
+    def __getstate__(self) -> Dict[str, Dict[Any, Any]]:
+        return {'op': self.op.__getstate__() if hasattr(self.op, '__getstate__') else {}}
+
+    def forward(self, data: List[np.ndarray], state: Dict[str, Any]) -> List[np.ndarray]:
         """Execute the wrapped operator a certain fraction of the time.
 
         Args:
@@ -45,5 +59,12 @@ class Sometimes(NumpyOp):
             The original `data`, or the `data` after running it through the wrapped operator.
         """
         if self.prob > np.random.uniform():
-            data = self.numpy_op.forward(data, state)
+            data = data[:self.inp_idx]  # Cut off the unnecessary inputs
+            if not self.op.in_list:
+                data = data[0]
+            data = self.op.forward(data, state)
+            if not self.op.out_list:
+                data = [data]
+        else:
+            data = [data[self.inputs.index(out)] for out in self.outputs]
         return data

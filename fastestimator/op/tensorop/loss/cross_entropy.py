@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from typing import Any, Dict, Iterable, List, Optional, TypeVar, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar, Union
 
 import tensorflow as tf
 import torch
@@ -20,14 +20,14 @@ import torch
 from fastestimator.backend.binary_crossentropy import binary_crossentropy
 from fastestimator.backend.categorical_crossentropy import categorical_crossentropy
 from fastestimator.backend.sparse_categorical_crossentropy import sparse_categorical_crossentropy
-from fastestimator.op.tensorop.tensorop import TensorOp
+from fastestimator.op.tensorop.loss.loss import LossOp
 from fastestimator.util.traceability_util import traceable
 
 Tensor = TypeVar('Tensor', tf.Tensor, torch.Tensor)
 
 
 @traceable()
-class CrossEntropy(TensorOp):
+class CrossEntropy(LossOp):
     """Calculate Element-Wise CrossEntropy (binary, categorical or sparse categorical).
 
     Args:
@@ -42,15 +42,14 @@ class CrossEntropy(TensorOp):
             automatically infer the correct form based on tensor shape.
     """
     def __init__(self,
-                 inputs: Union[None, str, Iterable[str]] = None,
-                 outputs: Union[None, str, Iterable[str]] = None,
+                 inputs: Union[Tuple[str, str], List[str]],
+                 outputs: str,
                  mode: Union[None, str, Iterable[str]] = "!infer",
                  from_logits: bool = False,
                  average_loss: bool = True,
                  form: Optional[str] = None):
-        super().__init__(inputs=inputs, outputs=outputs, mode=mode)
+        super().__init__(inputs=inputs, outputs=outputs, mode=mode, average_loss=average_loss)
         self.from_logits = from_logits
-        self.average_loss = average_loss
         self.form = form
         self.cross_entropy_fn = {
             "binary": binary_crossentropy,

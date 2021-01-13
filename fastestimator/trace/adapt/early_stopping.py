@@ -56,6 +56,7 @@ class EarlyStopping(Trace):
             raise ValueError("compare_mode can only be `min` or `max`")
 
         self.monitored_key = monitor
+        self.fe_monitor_names.add(monitor)
         self.min_delta = abs(min_delta)
         self.wait = 0
         self.best = 0
@@ -85,5 +86,5 @@ class EarlyStopping(Trace):
             self.wait += 1
             if self.wait >= self.patience:
                 self.system.stop_training = True
-                print("FastEstimator-EarlyStopping: '{}' triggered an early stop. Its best value was {} at epoch {}\
-                      ".format(self.monitored_key, self.best, self.system.epoch_idx - self.wait))
+                print("FastEstimator-EarlyStopping: '{}' triggered an early stop. Its best value was {} at epoch {}".
+                      format(self.monitored_key, self.best, self.system.epoch_idx - self.wait))

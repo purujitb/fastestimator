@@ -51,7 +51,8 @@ class BatchDataset(FEDataset):
         ```
 
     Args:
-        datasets: The dataset(s) to use for batch sampling.
+        datasets: The dataset(s) to use for batch sampling. While these should be FEDatasets, pytorch datasets will
+            technically also work. If you use them, however, you will lose the .split() and .summary() methods.
         num_samples: Number of samples to draw from the `datasets`. May be a single int if used in conjunction with
             `probability`, otherwise a list of ints of len(`datasets`) is required.
         probability: Probability to draw from each dataset. Only allowed if `num_samples` is an integer.
@@ -64,6 +65,7 @@ class BatchDataset(FEDataset):
         self.num_samples = to_list(num_samples)
         self.probability = to_list(probability)
         self.same_feature = False
+        self.all_fe_datasets = False
         self._check_input()
         self.index_maps = []
         self.reset_index_maps()
@@ -99,6 +101,7 @@ class BatchDataset(FEDataset):
             assert len(self.datasets) == len(self.num_samples), "the number of dataset must match num_samples"
         if not self.same_feature:
             assert len(set(self.num_samples)) == 1, "the number of samples must be the same for disjoint features"
+        self.all_fe_datasets = all([isinstance(dataset, FEDataset) for dataset in self.datasets])
 
     def _do_split(self, splits: Sequence[Iterable[int]]) -> List['BatchDataset']:
         """This class overwrites the .split() method instead of _do_split().
@@ -116,24 +119,24 @@ class BatchDataset(FEDataset):
         """Split this dataset into multiple smaller datasets.
 
         This function enables several types of splitting:
-            1. Splitting by fractions.
-                ```python
-                ds = fe.dataset.FEDataset(...)  # len(ds) == 1000
-                ds2 = ds.split(0.1)  # len(ds) == 900, len(ds2) == 100
-                ds3, ds4 = ds.split(0.1, 0.2)  # len(ds) == 630, len(ds3) == 90, len(ds4) == 180
-                ```
-            2. Splitting by counts.
-                ```python
-                ds = fe.dataset.FEDataset(...)  # len(ds) == 1000
-                ds2 = ds.split(100)  # len(ds) == 900, len(ds2) == 100
-                ds3, ds4 = ds.split(90, 180)  # len(ds) == 630, len(ds3) == 90, len(ds4) == 180
-                ```
-            3. Splitting by indices.
-                ``python
-                ds = fe.dataset.FEDataset(...)  # len(ds) == 1000
-                ds2 = ds.split([87,2,3,100,121,158])  # len(ds) == 994, len(ds2) == 6
-                ds3 = ds.split(range(100))  # len(ds) == 894, len(ds3) == 100
-                ```
+        1. Splitting by fractions.
+            ```python
+            ds = fe.dataset.FEDataset(...)  # len(ds) == 1000
+            ds2 = ds.split(0.1)  # len(ds) == 900, len(ds2) == 100
+            ds3, ds4 = ds.split(0.1, 0.2)  # len(ds) == 630, len(ds3) == 90, len(ds4) == 180
+            ```
+        2. Splitting by counts.
+            ```python
+            ds = fe.dataset.FEDataset(...)  # len(ds) == 1000
+            ds2 = ds.split(100)  # len(ds) == 900, len(ds2) == 100
+            ds3, ds4 = ds.split(90, 180)  # len(ds) == 630, len(ds3) == 90, len(ds4) == 180
+            ```
+        3. Splitting by indices.
+            ```python
+            ds = fe.dataset.FEDataset(...)  # len(ds) == 1000
+            ds2 = ds.split([87,2,3,100,121,158])  # len(ds) == 994, len(ds2) == 6
+            ds3 = ds.split(range(100))  # len(ds) == 894, len(ds3) == 100
+            ```
 
         Args:
             *fractions: Floating point values will be interpreted as percentages, integers as an absolute number of
@@ -144,7 +147,13 @@ class BatchDataset(FEDataset):
             One or more new datasets which are created by removing elements from the current dataset. The number of
             datasets returned will be equal to the number of `fractions` provided. If only a single value is provided
             then the return will be a single dataset rather than a list of datasets.
+
+        Raises:
+            NotImplementedError: If the user created this dataset using one or more non-FEDataset inputs.
         """
+        if not self.all_fe_datasets:
+            raise NotImplementedError(
+                "BatchDataset.split() is not supported when BatchDataset contains non-FEDataset objects")
         new_datasets = [to_list(ds.split(*fractions)) for ds in self.datasets]
         num_splits = len(new_datasets[0])
         new_datasets = [[ds[i] for ds in new_datasets] for i in range(num_splits)]
@@ -157,11 +166,17 @@ class BatchDataset(FEDataset):
             results = results[0]
         return results
 
+    def __getstate__(self) -> Dict[str, List[Dict[Any, Any]]]:
+        return {'datasets': [ds.__getstate__() if hasattr(ds, '__getstate__') else {} for ds in self.datasets]}
+
     def summary(self) -> DatasetSummary:
         """Generate a summary representation of this dataset.
         Returns:
             A summary representation of this dataset.
         """
+        if not self.all_fe_datasets:
+            print("FastEstimator-Warn: BatchDataset summary will be incomplete since non-FEDatasets were used.")
+            return DatasetSummary(num_instances=len(self), keys={})
         summaries = [ds.summary() for ds in self.datasets]
         keys = {k: v for summary in summaries for k, v in summary.keys.items()}
         return DatasetSummary(num_instances=len(self), keys=keys)

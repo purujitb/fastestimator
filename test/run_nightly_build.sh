@@ -1,5 +1,19 @@
 #!/bin/bash
 
+# Copyright 2020 The FastEstimator Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ===============================================================================
 full_path=$(realpath $0)
 dir_path=$(dirname $full_path)
 
@@ -20,8 +34,8 @@ for file in $(find $dir_path/apphub_scripts -type f); do
 
         # clean GPU memory
         if ls /dev/nvidia* 1> /dev/null 2>&1; then
-            for i in $(sudo lsof /dev/nvidia* | awk 'FNR>1 {print $2}' | sort -u); do
-                sudo kill -9 $i;
+            for i in $(lsof /dev/nvidia* | awk 'FNR>1 {print $2}' | sort -u); do
+                kill -9 $i;
             done
         fi
 
@@ -45,14 +59,14 @@ for nb_in in $(find $dir_path/tutorial -type f); do
         current_dir=$(dirname $nb_in)
         stderr_file=${nb_in/'.ipynb'/'_stderr.txt'}
         start=`date +%s`
-        papermill $nb_in $nb_out 2>> $stderr_file --cwd $current_dir
+        papermill $nb_in $nb_out -k nightly_build 2>> $stderr_file --cwd $current_dir
         result[$nb_in]=$?
         end=`date +%s`
 
         # clean GPU memory
         if ls /dev/nvidia* 1> /dev/null 2>&1; then
-            for i in $(sudo lsof /dev/nvidia* | awk 'FNR>1 {print $2}' | sort -u); do
-                sudo kill -9 $i;
+            for i in $(lsof /dev/nvidia* | awk 'FNR>1 {print $2}' | sort -u); do
+                kill -9 $i;
             done
         fi
 

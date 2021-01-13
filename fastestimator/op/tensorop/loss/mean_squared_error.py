@@ -12,21 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from typing import Any, Dict, Iterable, List, TypeVar, Union
+from typing import Any, Dict, Iterable, List, Tuple, TypeVar, Union
 
 import tensorflow as tf
 import torch
 
 from fastestimator.backend.mean_squared_error import mean_squared_error
 from fastestimator.backend.reduce_mean import reduce_mean
-from fastestimator.op.tensorop.tensorop import TensorOp
+from fastestimator.op.tensorop.loss.loss import LossOp
 from fastestimator.util.traceability_util import traceable
 
 Tensor = TypeVar('Tensor', tf.Tensor, torch.Tensor)
 
 
 @traceable()
-class MeanSquaredError(TensorOp):
+class MeanSquaredError(LossOp):
     """Calculate the mean squared error loss between two tensors.
 
     Args:
@@ -35,11 +35,12 @@ class MeanSquaredError(TensorOp):
         mode: What mode(s) to execute this Op in. For example, "train", "eval", "test", or "infer". To execute
             regardless of mode, pass None. To execute in all modes except for a particular one, you can pass an argument
             like "!infer" or "!train".
+        average_loss: Whether to average the element-wise loss after the Loss Op.
     """
     def __init__(self,
-                 inputs: Union[None, str, Iterable[str]] = None,
-                 outputs: Union[None, str, Iterable[str]] = None,
-                 mode: Union[None, str, Iterable[str]] = None,
+                 inputs: Union[Tuple[str, str], List[str]],
+                 outputs: str,
+                 mode: Union[None, str, Iterable[str]] = "!infer",
                  average_loss: bool = True):
         self.average_loss = average_loss
         super().__init__(inputs=inputs, outputs=outputs, mode=mode)

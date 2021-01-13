@@ -1,3 +1,17 @@
+# Copyright 2020 The FastEstimator Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 import unittest
 
 import numpy as np
@@ -353,6 +367,44 @@ class TestPipelineGetResults(unittest.TestCase):
             "y": np.array([[-99], [-98], [-97], [-96]], dtype=np.float32)
         }
         self.assertTrue(is_equal(data, ans))
+
+    def test_pipeline_get_result_dict_batch_size(self):
+        pipeline = fe.Pipeline(train_data=self.sample_torch_dataset,
+                               ops=NumpyOpAdd1(inputs="x", outputs="y"),
+                               batch_size={"train": 1})
+        data = pipeline.get_results(mode="train", epoch=1)
+        data["x"] = data["x"].numpy()
+        data["y"] = data["y"].numpy()
+        ans = {"x": np.array([[0]], dtype=np.float32), "y": np.array([[1]], dtype=np.float32)}
+        self.assertTrue(is_equal(data, ans))
+
+    def test_pipeline_get_result_dict_batch_size_scheduler(self):
+        pipeline = fe.Pipeline(train_data=self.sample_torch_dataset,
+                               ops=NumpyOpAdd1(inputs="x", outputs="y"),
+                               batch_size=EpochScheduler({1: {
+                                   "train": 1
+                               }}))
+        data = pipeline.get_results(mode="train", epoch=1)
+        data["x"] = data["x"].numpy()
+        data["y"] = data["y"].numpy()
+        ans = {"x": np.array([[0]], dtype=np.float32), "y": np.array([[1]], dtype=np.float32)}
+        self.assertTrue(is_equal(data, ans))
+
+    def test_pipeline_get_result_dict_batch_size_train_eval(self):
+        pipeline = fe.Pipeline(train_data=self.sample_torch_dataset,
+                               eval_data=self.sample_torch_dataset,
+                               ops=NumpyOpAdd1(inputs="x", outputs="y"),
+                               batch_size={"train": 2, "eval": 1})
+        data_train = pipeline.get_results(mode="train", epoch=1)
+        data_eval = pipeline.get_results(mode="eval", epoch=1)
+        data_train["x"] = data_train["x"].numpy()
+        data_train["y"] = data_train["y"].numpy()
+        data_eval["x"] = data_eval["x"].numpy()
+        data_eval["y"] = data_eval["y"].numpy()
+        ans_train = {"x": np.array([[0], [1]], dtype=np.float32), "y": np.array([[1], [2]], dtype=np.float32)}
+        ans_eval = {"x": np.array([[0]], dtype=np.float32), "y": np.array([[1]], dtype=np.float32)}
+        self.assertTrue(is_equal(data_train, ans_train))
+        self.assertTrue(is_equal(data_eval, ans_eval))
 
 
 class TestPipelineGetLoader(unittest.TestCase):

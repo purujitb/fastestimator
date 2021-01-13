@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import math
 from typing import List, Optional, Union
 
 import torch
@@ -63,13 +64,25 @@ class HadamardCode(nn.Module):
         n_classes: How many output classes to map onto.
         code_length: How long of an error correcting code to use. Should be a positive multiple of 2. If not provided,
             the smallest power of 2 which is >= `n_outputs` will be used, or 16 if the latter is larger.
+        max_prob: The maximum probability that can be assigned to a class. For numeric stability this must be less than
+            1.0. Intuitively it makes sense to keep this close to 1, but to get adversarial training benefits it should
+            be noticeably less than 1, for example 0.95 or even 0.8.
+        power: The power parameter to be used by Inverse Distance Weighting when transforming Hadamard class distances
+            into a class probability distribution. A value of 1.0 gives an intuitive mapping to probabilities, but small
+            values such as 0.25 appear to give slightly better adversarial benefits. Large values like 2 or 3 give
+            slightly faster convergence at the expense of adversarial performance. Must be greater than zero.
 
     Raises:
         ValueError: If `code_length` is invalid.
     """
     heads: Union[nn.ModuleList, nn.Module]
 
-    def __init__(self, in_features: Union[int, List[int]], n_classes: int, code_length: Optional[int] = None) -> None:
+    def __init__(self,
+                 in_features: Union[int, List[int]],
+                 n_classes: int,
+                 code_length: Optional[int] = None,
+                 max_prob: float = 0.95,
+                 power: float = 1.0) -> None:
         super().__init__()
         self.n_classes = n_classes
         if code_length is None:
@@ -77,40 +90,42 @@ class HadamardCode(nn.Module):
         if code_length <= 0 or (code_length & (code_length - 1) != 0):
             raise ValueError(f"code_length must be a positive power of 2, but got {code_length}.")
         if code_length < n_classes:
-            raise ValueError(f"code_length must be >= n_classes, but got {code_length} and {n_classes}")
+            raise ValueError(f"code_length must be >= n_classes, but got {code_length} and {n_classes}.")
         self.code_length = code_length
-        self.labels = nn.Parameter(
-            torch.tensor(hadamard(self.code_length)[:self.n_classes], dtype=torch.float32).T, requires_grad=False)
-        single_input = isinstance(in_features, int)
+        if power <= 0:
+            raise ValueError(f"power must be positive, but got {power}.")
+        self.power = nn.Parameter(torch.tensor(power), requires_grad=False)
+        if not 0.0 < max_prob < 1.0:
+            raise ValueError(f"max_prob must be in the range (0, 1), but got {max_prob}")
+        self.eps = nn.Parameter(
+            torch.tensor(self.code_length * math.pow((1.0 - max_prob) / (max_prob * (self.n_classes - 1)), 1 / power)),
+            requires_grad=False)
+        labels = hadamard(self.code_length)
+        # Cut off 0th column b/c it's constant. It would also be possible to make the column sign alternate, but that
+        # would break the symmetry between rows in the code.
+        labels = labels[:self.n_classes, 1:]
+        self.labels = nn.Parameter(torch.tensor(labels, dtype=torch.float32), requires_grad=False)
         in_features = to_list(in_features)
-        if len(in_features) > code_length:
+        if len(in_features) > code_length - 1:
             raise ValueError(f"Too many input heads {len(in_features)} for the given code length {self.code_length}.")
         head_sizes = [self.code_length // len(in_features) for _ in range(len(in_features))]
         head_sizes[0] = head_sizes[0] + self.code_length - sum(head_sizes)
+        head_sizes[0] = head_sizes[0] - 1  # We're going to cut off the 0th column from the code
         self.heads = nn.ModuleList([
             nn.Linear(in_features=in_feat, out_features=out_feat) for in_feat, out_feat in zip(in_features, head_sizes)
         ])
-        # List comprehension is slow, so we will avoid it for users who don't need it
-        if single_input:
-            self._forward_fn = self._single_head_forward
-            self.heads = self.heads[0]
+
+    def forward(self, x: List[torch.Tensor]) -> torch.Tensor:
+        # can't have forward function call subfunctions otherwise will fail on multi-gpu
+        if isinstance(x, list):
+            x = [head(tensor) for head, tensor in zip(self.heads, x)]
+            x = torch.cat(x, dim=-1)
         else:
-            self._forward_fn = self._multi_heads_forward
-
-    def _single_head_forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.heads(x)
+            x = self.heads[0](x)
         x = torch.tanh(x)
-        x = torch.matmul(x, self.labels) + self.code_length
-        x = torch.div(x, torch.sum(x, dim=1).view(-1, 1))
+        # Compute L1 distance
+        x = torch.max(torch.sum(torch.abs(torch.unsqueeze(x, dim=1) - self.labels), dim=-1), self.eps)
+        # Inverse Distance Weighting
+        x = 1.0 / torch.pow(x, self.power)
+        x = torch.div(x, torch.sum(x, dim=-1).view(-1, 1))
         return x
-
-    def _multi_heads_forward(self, x: List[torch.Tensor]) -> torch.Tensor:
-        x = [head(tensor) for head, tensor in zip(self.heads, x)]
-        x = torch.cat(x, dim=-1)
-        x = torch.tanh(x)
-        x = torch.matmul(x, self.labels) + self.code_length
-        x = torch.div(x, torch.sum(x, dim=1).view(-1, 1))
-        return x
-
-    def forward(self, x: Union[torch.Tensor, List[torch.Tensor]]) -> torch.Tensor:
-        return self._forward_fn(x)

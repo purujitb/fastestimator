@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import os
+import tempfile
 from collections import ChainMap
 from typing import Any, Callable, Dict, Iterable, List, MutableMapping, Optional, Set, Tuple, TypeVar, Union
 
+import gdown
+import numpy as np
 import tensorflow as tf
 import torch
 from tensorflow.keras.mixed_precision import experimental as mixed_precision_tf
@@ -22,9 +26,9 @@ from tensorflow.python.distribute.values import DistributedValues
 
 from fastestimator.backend.load_model import load_model
 from fastestimator.backend.to_tensor import to_tensor
-from fastestimator.op.op import LambdaOp, get_inputs_by_op, write_outputs_by_op
-from fastestimator.op.tensorop import TensorOp
-from fastestimator.op.tensorop.model.model import ModelOp
+from fastestimator.op.numpyop import NumpyOp, forward_numpyop
+from fastestimator.op.op import get_inputs_by_op, write_outputs_by_op
+from fastestimator.op.tensorop.tensorop import TensorOp
 from fastestimator.op.tensorop.model.update import UpdateOp
 from fastestimator.schedule.schedule import EpochScheduler, RepeatScheduler, Scheduler, get_current_items
 from fastestimator.util.traceability_util import trace_model, traceable
@@ -32,6 +36,8 @@ from fastestimator.util.util import NonContext, get_batch_size, to_list
 
 Model = TypeVar('Model', tf.keras.Model, torch.nn.Module)
 T = TypeVar('T')
+
+GOOGLE_DRIVE_URL = "https://drive.google.com"
 
 
 @traceable()
@@ -41,18 +47,35 @@ class BaseNetwork:
     Networks are used to define the computation graph surrounding one or more models during training.
 
     Args:
+        target_type: What tensor type is expected by this network ('torch' or 'tf').
         ops: The operators to be executed throughout training / testing / inference. These are likely to contain one or
             more model ops, as well as loss ops and update ops.
+        postprocessing: A collection of NumpyOps to be run on the CPU after all of the normal `ops` have been executed.
+            Unlike the NumpyOps found in the pipeline, these ops will run on batches of data rather than single points.
+
     """
-    def __init__(self, ops: Iterable[Union[TensorOp, Scheduler[TensorOp]]]) -> None:
+    def __init__(
+        self,
+        target_type: str,
+        device: Optional[torch.device],
+        ops: Iterable[Union[TensorOp, Scheduler[TensorOp]]],
+        postprocessing: Union[None, NumpyOp, Scheduler[NumpyOp], Iterable[Union[NumpyOp, Scheduler[NumpyOp]]]] = None
+    ) -> None:
         self.ops = to_list(ops)
+        self.target_type = target_type
+        self.device = device
+        for op in get_current_items(self.ops):
+            op.build(framework=self.target_type, device=self.device)
         self.models = to_list(_collect_models(ops))
+        self.postprocessing = to_list(postprocessing)
         self._verify_inputs()
         self.effective_inputs = dict()
         self.effective_outputs = dict()
         self.epoch_ops = []
+        self.epoch_postprocessing = []
         self.epoch_models = set()
         self.epoch_state = dict()
+        self.scaler = None
 
     def _verify_inputs(self) -> None:
         """Ensure that all ops are TensorOps.
@@ -61,7 +84,9 @@ class BaseNetwork:
             AssertionError: If any of the ops are not TensorOps.
         """
         for op in get_current_items(self.ops):
-            assert isinstance(op, (TensorOp, LambdaOp)), "unsupported op format, must provide TensorOp in Network"
+            assert isinstance(op, TensorOp), "unsupported op format, Network ops must be TensorOps"
+        for op in get_current_items(self.postprocessing):
+            assert isinstance(op, NumpyOp), "unsupported op format, Network postprocessing must be NumpyOps"
 
     def get_scheduled_items(self, mode: str) -> List[Any]:
         """Get a list of items considered for scheduling.
@@ -73,9 +98,9 @@ class BaseNetwork:
             List of schedulable items in Network.
         """
         if mode == "train":
-            all_items = self.ops + [model.optimizer for model in self.models]
+            all_items = self.ops + [model.optimizer for model in self.models] + self.postprocessing
         else:
-            all_items = self.ops
+            all_items = self.ops + self.postprocessing
         return all_items
 
     def load_epoch(self, mode: str, epoch: int, output_keys: Optional[Set[str]] = None, warmup: bool = False) -> None:
@@ -93,13 +118,23 @@ class BaseNetwork:
         self.effective_inputs[mode] = self.get_effective_input_keys(mode, epoch)
         self.effective_outputs[mode] = self.get_all_output_keys(mode, epoch)
         if output_keys:
-            self.effective_outputs[mode] = self.effective_outputs[mode].intersection(output_keys)
+            self.effective_outputs[mode] = self.effective_outputs[mode].intersection(
+                output_keys) | self._get_effective_postprocessing_input_keys(mode, epoch)
         self.epoch_ops = get_current_items(self.ops, mode, epoch)
-        self.epoch_models = set(op.model for op in self.epoch_ops if isinstance(op, (UpdateOp, ModelOp)))
-        gradient_ops = [op for op in self.epoch_ops if hasattr(op, "retain_graph")]
+        self.epoch_postprocessing = get_current_items(self.postprocessing, mode, epoch)
+        self.epoch_models = set.union(*[op.get_fe_models() for op in self.epoch_ops])
+        gradient_ops = [op for op in self.epoch_ops if op.fe_retain_graph() is not None]
         for idx, gradient_op in enumerate(gradient_ops):
-            gradient_op.retain_graph = idx != len(gradient_ops) - 1
-        self.epoch_state = {"warmup": warmup, "mode": mode, "req_grad": len(gradient_ops) > 0, "epoch": epoch}
+            gradient_op.fe_retain_graph(idx != len(gradient_ops) - 1)
+        self.epoch_state = {
+            "warmup": warmup,
+            "mode": mode,
+            "req_grad": len(gradient_ops) > 0,
+            "epoch": epoch,
+            "deferred": {},
+            "scaler": self.scaler
+        }
+        # warmup: bool, mode: str, req_grad: bool, epoch: int, deferred: Dict[str, List[Callable]]]
         for model in self.epoch_models:
             if hasattr(model, "optimizer") and model.optimizer is not None:
                 if isinstance(model.optimizer, Scheduler):
@@ -120,8 +155,7 @@ class BaseNetwork:
         """
         loss_keys = set()
         for op in get_current_items(self.ops):
-            if isinstance(op, UpdateOp):
-                loss_keys.update(op.inputs)
+            loss_keys |= op.get_fe_loss_keys()
         return loss_keys
 
     def get_effective_input_keys(self, mode: str, epoch: int) -> Set[str]:
@@ -136,7 +170,24 @@ class BaseNetwork:
         """
         input_keys = set()
         produced_keys = set()
-        for op in get_current_items(self.ops, mode, epoch):
+        for op in get_current_items(self.ops + self.postprocessing, mode, epoch):
+            input_keys.update(set(key for key in op.inputs if key not in produced_keys))
+            produced_keys.update(op.outputs)
+        return input_keys
+
+    def _get_effective_postprocessing_input_keys(self, mode: str, epoch: int) -> Set[str]:
+        """Determine which keys need to be provided as input to the postprocessing during the given `epoch`.
+
+        Args:
+            mode: The execution mode to consider. One of 'train', 'eval', 'test', or 'infer'.
+            epoch: The epoch number to consider for determining inputs.
+
+        Returns:
+            The necessary inputs for the postprocessing to execute the given `epoch` and `mode`.
+        """
+        input_keys = set()
+        produced_keys = set()
+        for op in get_current_items(self.postprocessing, mode, epoch):
             input_keys.update(set(key for key in op.inputs if key not in produced_keys))
             produced_keys.update(op.outputs)
         return input_keys
@@ -152,7 +203,7 @@ class BaseNetwork:
             The keys that will be generated by the network's Ops during the `epoch` for the given `mode`.
         """
         output_keys = set()
-        for op in get_current_items(self.ops, mode, epoch):
+        for op in get_current_items(self.ops + self.postprocessing, mode, epoch):
             output_keys.update(op.outputs)
         return output_keys
 
@@ -171,9 +222,31 @@ class BaseNetwork:
             data = op.forward(data, state)
             if op.outputs:
                 write_outputs_by_op(op, batch, data)
+        for fn_list in state['deferred'].values():
+            for fn in fn_list:
+                fn()
+        state['deferred'].clear()
 
     def run_step(self, batch: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:  # Batch, Prediction
-        """Run a forward step through the Network on a batch of data.
+        """Run a forward step through the Network on a batch of data, including postprocessing.
+
+        This method expects that Network.load_epoch() has already been invoked. The return data will be on the CPU.
+
+        Args:
+            batch: The batch of data serving as input to the Network.
+
+        Returns:
+            (batch_data, prediction_data)
+        """
+        batch, prediction = self._run_step(batch)
+        forward_numpyop(ops=self.epoch_postprocessing,
+                        data=ChainMap(prediction, batch),
+                        state=self.epoch_state,
+                        batched=True)
+        return batch, prediction
+
+    def _run_step(self, batch: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:  # Batch, Prediction
+        """Run a forward step through the Network on a batch of data, excluding postprocessing.
 
         Implementations of this method within derived classes should handle bringing the prediction data back from the
         (multi-)GPU environment to the CPU. This method expects that Network.load_epoch() has already been invoked.
@@ -195,9 +268,13 @@ class BaseNetwork:
             epoch: The epoch in which to run the transform.
 
         Returns:
-            (batch_data, prediction_data)
+            prediction_data overlaid on the input `data`.
         """
-        raise NotImplementedError
+        self.load_epoch(mode, epoch, warmup=False)
+        data = to_tensor(data, target_type=self.target_type)
+        data, prediction = self.run_step(data)
+        self.unload_epoch()
+        return {**data, **prediction}
 
 
 def _collect_models(ops: Iterable[Union[TensorOp, Scheduler[TensorOp]]]) -> Set[Model]:
@@ -211,19 +288,24 @@ def _collect_models(ops: Iterable[Union[TensorOp, Scheduler[TensorOp]]]) -> Set[
     """
     models = set()
     for op in get_current_items(ops):
-        if isinstance(op, (ModelOp, UpdateOp)):
-            models.add(op.model)
+        models |= op.get_fe_models()
     return models
 
 
 # noinspection PyPep8Naming
-def Network(ops: Iterable[Union[TensorOp, Scheduler[TensorOp]]]) -> BaseNetwork:
+def Network(
+    ops: Iterable[Union[TensorOp, Scheduler[TensorOp]]],
+    pops: Union[None, NumpyOp, Scheduler[NumpyOp], Iterable[Union[NumpyOp, Scheduler[NumpyOp]]]] = None
+) -> BaseNetwork:
     """A function to automatically instantiate the correct Network derived class based on the given `ops`.
 
     Args:
         ops: A collection of Ops defining the graph for this Network. It should contain at least one ModelOp, and all
             models should be either TensorFlow or Pytorch. We currently do not support mixing TensorFlow and Pytorch
             models within the same network.
+        pops: Postprocessing Ops. A collection of NumpyOps to be run on the CPU after all of the normal `ops` have been
+            executed. Unlike the NumpyOps found in the pipeline, these ops will run on batches of data rather than
+            single points.
 
     Returns:
         A network instance containing the given `ops`.
@@ -233,22 +315,27 @@ def Network(ops: Iterable[Union[TensorOp, Scheduler[TensorOp]]]) -> BaseNetwork:
         ValueError: If a model is provided whose type cannot be identified as either TensorFlow or PyTorch.
     """
     models = _collect_models(ops)
-    assert models, "cannot find model in Network ops"
     framework = set()
+    model_names = set()
     for model in models:
+        # 'Model' and 'model' should not be considered unique in case you are saving on a non-case-sensitive filesystem
+        model_names.add(model.model_name.lower())
         if isinstance(model, tf.keras.Model):
             framework.add("tf")
         elif isinstance(model, torch.nn.Module):
             framework.add("torch")
         else:
             framework.add("unknown")
+    if len(framework) == 0:
+        framework.add('tf')  # We will use tf as default framework if no models are found
     assert len(framework) == 1, "please make sure either tensorflow or torch model is used in network"
+    assert len(model_names) == len(models), "all models must have unique model names"
 
     framework = framework.pop()
     if framework == "tf":
-        network = TFNetwork(ops)
+        network = TFNetwork(ops, pops)
     elif framework == "torch":
-        network = TorchNetwork(ops)
+        network = TorchNetwork(ops, pops)
     else:
         raise ValueError("Unknown model type")
     return network
@@ -260,12 +347,21 @@ class TorchNetwork(BaseNetwork):
 
     Args:
         ops: The ops defining the execution graph for this Network.
+        postprocessing: A collection of NumpyOps to be run on the CPU after all of the normal `ops` have been executed.
+            Unlike the NumpyOps found in the pipeline, these ops will run on batches of data rather than single points.
+
     """
-    def __init__(self, ops: Iterable[Union[TensorOp, Scheduler[TensorOp]]]) -> None:
-        super().__init__(ops)
-        for op in get_current_items(self.ops):
-            op.build(framework='torch')
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    def __init__(
+        self,
+        ops: Iterable[Union[TensorOp, Scheduler[TensorOp]]],
+        postprocessing: Union[None, NumpyOp, Scheduler[NumpyOp], Iterable[Union[NumpyOp, Scheduler[NumpyOp]]]] = None
+    ) -> None:
+        super().__init__(target_type='torch',
+                         device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
+                         ops=ops,
+                         postprocessing=postprocessing)
+        if any([model.mixed_precision for model in self.models]):
+            self.scaler = torch.cuda.amp.GradScaler()
 
     def load_epoch(self, mode: str, epoch: int, output_keys: Optional[Set[str]] = None, warmup: bool = False) -> None:
         """Prepare the network to run a given epoch and mode.
@@ -287,8 +383,16 @@ class TorchNetwork(BaseNetwork):
                 if model.current_optimizer and mode == "train":
                     # move optimizer variables to gpu
                     self._move_optimizer_between_device(model.current_optimizer.state, self.device)
+        # Set all of the contiguous final updates to defer their updates by default to enable things like CycleGan
+        # This is not necessary for TF because overriding tf weights does not confuse the gradient tape computation
+        for op in reversed(self.epoch_ops):
+            if isinstance(op, UpdateOp):
+                op._old_defer = op.defer
+                op.defer = True
+            else:
+                break
 
-    def _move_optimizer_between_device(self, data: Dict[str, Any], device: str) -> None:
+    def _move_optimizer_between_device(self, data: Dict[str, Any], device: Union[str, torch.device]) -> None:
         """Move optimizer state between gpu and cpu recursively.
 
         Args:
@@ -316,6 +420,12 @@ class TorchNetwork(BaseNetwork):
                 if model.current_optimizer and self.epoch_state["mode"] == "train":
                     # move optimizer variables to cpu
                     self._move_optimizer_between_device(model.current_optimizer.state, "cpu")
+        # Set the final update ops back to their original defer status
+        for op in reversed(self.epoch_ops):
+            if isinstance(op, UpdateOp):
+                op.defer = op.__dict__.get('_old_defer', op.defer)
+            else:
+                break
 
     def _get_effective_batch_input(self, batch: MutableMapping[str, Any], mode: str) -> Dict[str, Any]:
         """Copy input data from the the CPU onto the GPU(s).
@@ -339,7 +449,7 @@ class TorchNetwork(BaseNetwork):
             new_batch = {key: batch[key] for key in self.effective_inputs[mode] if key in batch}
         return new_batch
 
-    def run_step(self, batch: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    def _run_step(self, batch: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Run a forward step through the Network on a batch of data.
 
         Implementations of this method within derived classes should handle bringing the prediction data back from the
@@ -356,7 +466,12 @@ class TorchNetwork(BaseNetwork):
         self.epoch_state["tape"] = NonContext()
         # gpu operation
         with torch.no_grad() if not self.epoch_state["req_grad"] else NonContext():
-            self._forward_batch(batch_in, self.epoch_state, self.epoch_ops)
+            with torch.cuda.amp.autocast() if self.epoch_state["scaler"] is not None else NonContext():
+                self._forward_batch(batch_in, self.epoch_state, self.epoch_ops)
+        # if the loss scaler is used for training, update the scaler
+        if not self.epoch_state["warmup"] and self.epoch_state[
+                "mode"] == "train" and self.epoch_state["scaler"] is not None:
+            self.epoch_state["scaler"].update()
         # copy data to cpu
         if self.device.type == "cuda":
             prediction = {
@@ -370,7 +485,7 @@ class TorchNetwork(BaseNetwork):
             }
         return batch, prediction
 
-    def _move_tensor_between_device(self, data: T, device: str) -> T:
+    def _move_tensor_between_device(self, data: T, device: Union[str, torch.device]) -> T:
         """Move tensor between gpu and cpu recursively.
 
         Args:
@@ -413,24 +528,6 @@ class TorchNetwork(BaseNetwork):
         elif isinstance(data, torch.Tensor):
             return data.detach()
 
-    def transform(self, data: Dict[str, Any], mode: str, epoch: int = 1) -> Dict[str, Any]:
-        """Run a forward step through the Network on an element of data.
-
-        Args:
-            data: The element to data to use as input.
-            mode: The mode in which to run the transform. One of 'train', 'eval', 'test', or 'infer'.
-            epoch: The epoch in which to run the transform.
-
-        Returns:
-            (batch_data, prediction_data)
-        """
-        self.load_epoch(mode, epoch, warmup=False)
-        data = to_tensor(data, "torch")
-        data, prediction = self.run_step(data)
-        self.unload_epoch()
-        data.update(prediction)
-        return data
-
 
 @traceable()
 class TFNetwork(BaseNetwork):
@@ -438,11 +535,15 @@ class TFNetwork(BaseNetwork):
 
     Args:
         ops: The ops defining the execution graph for this Network.
+        postprocessing: A collection of NumpyOps to be run on the CPU after all of the normal `ops` have been executed.
+            Unlike the NumpyOps found in the pipeline, these ops will run on batches of data rather than single points.
     """
-    def __init__(self, ops: Iterable[Union[TensorOp, Scheduler[TensorOp]]]) -> None:
-        super().__init__(ops)
-        for op in get_current_items(self.ops):
-            op.build(framework='tf')
+    def __init__(
+        self,
+        ops: Iterable[Union[TensorOp, Scheduler[TensorOp]]],
+        postprocessing: Union[None, NumpyOp, Scheduler[NumpyOp], Iterable[Union[NumpyOp, Scheduler[NumpyOp]]]] = None
+    ) -> None:
+        super().__init__(target_type='tf', device=None, ops=ops, postprocessing=postprocessing)
 
     def load_epoch(self, mode: str, epoch: int, output_keys: Optional[Set[str]] = None, warmup: bool = False) -> None:
         """Prepare the network to run a given epoch and mode.
@@ -459,7 +560,7 @@ class TFNetwork(BaseNetwork):
         super().load_epoch(mode, epoch, output_keys, warmup)
         self.epoch_state["epoch"] = tf.convert_to_tensor(self.epoch_state["epoch"])
 
-    def run_step(self, batch: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    def _run_step(self, batch: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Run a forward step through the Network on a batch of data.
 
         Implementations of this method within derived classes should handle bringing the prediction data back from the
@@ -476,11 +577,11 @@ class TFNetwork(BaseNetwork):
         strategy = tf.distribute.get_strategy()
         if isinstance(strategy, tf.distribute.MirroredStrategy):
             if self.epoch_state["warmup"] == "debug":
-                prediction = strategy.experimental_run_v2(
+                prediction = strategy.run(
                     self._forward_step_eager,
                     args=(batch_in, self.epoch_state, self.epoch_ops, to_list(self.effective_outputs[mode])))
             else:
-                prediction = strategy.experimental_run_v2(
+                prediction = strategy.run(
                     self._forward_step_static,
                     args=(batch_in, self.epoch_state, self.epoch_ops, to_list(self.effective_outputs[mode])))
             batch = self._per_replica_to_global(batch)
@@ -592,7 +693,7 @@ class TFNetwork(BaseNetwork):
         Returns:
             The prediction dictionary resulting from a forward pass of the Network.
         """
-        batch = ChainMap({}, batch)
+        batch = dict(batch)
         prediction = {}
         with tf.GradientTape(persistent=True) if state["req_grad"] else NonContext() as tape:
             state['tape'] = tape
@@ -615,21 +716,50 @@ class TFNetwork(BaseNetwork):
         Returns:
             (batch_data, prediction_data)
         """
-        self.load_epoch(mode, epoch, warmup=False)
-        data = to_tensor(data, target_type="tf")
-        data, prediction = self.run_step(data)
-        self.unload_epoch()
-        # handle tensorflow multi-gpu inferencing issue, it will replicate data on each device
-        if isinstance(tf.distribute.get_strategy(), tf.distribute.MirroredStrategy):
-            prediction = self._subsample_data(prediction, get_batch_size(data))
-        data.update(prediction)
-        return data
+        # Distribute multi-gpu data for processing
+        sub_sample = False
+        strategy = tf.distribute.get_strategy()
+        if isinstance(strategy, tf.distribute.MirroredStrategy):
+            batch_size, num_devices = get_batch_size(data), strategy.num_replicas_in_sync
+            if batch_size < num_devices:
+                data = self._fill_batch(data, num_devices - batch_size)
+                sub_sample = True
+            data = next(iter(strategy.experimental_distribute_dataset(tf.data.Dataset.from_tensors(data))))
+        results = super().transform(data, mode, epoch)
+        if sub_sample:
+            results = self._subsample_data(results, batch_size)
+        return results
+
+    def _fill_batch(self, data: T, n: int) -> T:
+        """Fill data on batch dimension repeating the first n indices at the end.
+
+        Args:
+            data: The data to be filled.
+            n: The number of times to be repeated.
+
+        Returns:
+            Filled data.
+        """
+        if isinstance(data, dict):
+            return {key: self._fill_batch(val, n) for (key, val) in data.items()}
+        elif isinstance(data, list):
+            return [self._fill_batch(val, n) for val in data]
+        elif isinstance(data, tuple):
+            return tuple([self._fill_batch(val, n) for val in data])
+        elif isinstance(data, set):
+            return set([self._fill_batch(val, n) for val in data])
+        elif hasattr(data, "shape"):
+            paddings = [[0, n]] + [[0, 0] for _ in range(len(data.shape) - 1)]
+            return np.pad(data, pad_width=paddings, mode="symmetric")
+        else:
+            return data
 
     def _subsample_data(self, data: T, n: int) -> T:
         """Subsample data by selecting the first n indices recursively.
 
         Args:
             data: The data to be subsampled.
+            n: The number of indices to be subsampled.
 
         Returns:
             Subsampled data.
@@ -679,7 +809,7 @@ def build(model_fn: Callable[[], Union[Model, List[Model]]],
             automatically generated and assigned.
         weights_path: Path(s) from which to load model weights. If not None, then the number of weight paths provided
             should match the number of models generated by the `model_fn`.
-        mixed_precision: Whether to enable mix precision network operations, only applies to tensorflow models.
+        mixed_precision: Whether to enable mix precision network operations.
 
     Returns:
         models: The model(s) built by FastEstimator.
@@ -691,11 +821,6 @@ def build(model_fn: Callable[[], Union[Model, List[Model]]],
 
     if not hasattr(build, "count"):
         build.count = 0
-    # mix-precision handling
-    if mixed_precision:
-        mixed_precision_tf.set_policy(mixed_precision_tf.Policy('mixed_float16'))
-    else:
-        mixed_precision_tf.set_policy(mixed_precision_tf.Policy('float32'))
     models, optimizer_fn = to_list(model_fn()), to_list(optimizer_fn)
     # fill optimizer
     if not optimizer_fn:
@@ -703,6 +828,11 @@ def build(model_fn: Callable[[], Union[Model, List[Model]]],
     # check framework
     if isinstance(models[0], tf.keras.Model):
         framework = "tf"
+        # tensorflow mix-precision instantiation
+        if mixed_precision:
+            mixed_precision_tf.set_policy(mixed_precision_tf.Policy('mixed_float16'))
+        else:
+            mixed_precision_tf.set_policy(mixed_precision_tf.Policy('float32'))
     elif isinstance(models[0], torch.nn.Module):
         framework = "torch"
     else:
@@ -714,6 +844,9 @@ def build(model_fn: Callable[[], Union[Model, List[Model]]],
             models = to_list(model_fn())
         if framework == "torch":
             models = [torch.nn.DataParallel(model) for model in models]
+    # mark models with its mixed_precision flag
+    for model in models:
+        model.mixed_precision = mixed_precision
     # generate names
     if not model_name:
         model_name = _generate_model_names(len(models))
@@ -768,8 +901,16 @@ def _fe_compile(model: Model,
         model.current_optimizer = optimizer_fn
     model.optimizer = optimizer_fn
     model.fe_compiled = True
+
     if weight:
+        if weight.startswith(GOOGLE_DRIVE_URL):
+            tmp_dir = tempfile.mkdtemp()
+            file_name = gdown.download(weight, quiet=False)
+            os.rename(os.path.join('./', file_name), os.path.join(tmp_dir, file_name))
+            weight = gdown.download(weight, os.path.join(tmp_dir, file_name), quiet=False)
+
         load_model(model, weight)
+
     model.model_name = name
     return model
 

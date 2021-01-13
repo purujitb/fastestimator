@@ -1,0 +1,5 @@
+pep257:
+  run: true
+  disable:
+    - D213
+    - D207
